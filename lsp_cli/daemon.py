@@ -13,41 +13,16 @@ import socket
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
+from lsp_cli.daemon_state import DAEMON_DIR, LOG_FILE, PID_FILE, PORT_FILE, is_daemon_running
+from lsp_cli.observability import emit_event
 from lsp_cli.protocol import Request, Response, make_error, read_message
 from lsp_cli.session import SessionManager, SessionStatus
 
 log = logging.getLogger(__name__)
-
-# Default paths
-DAEMON_DIR = Path.home() / ".lsp-cli"
-PID_FILE = DAEMON_DIR / "daemon.pid"
-PORT_FILE = DAEMON_DIR / "daemon.port"
-LOG_FILE = DAEMON_DIR / "daemon.log"
-
-
-def get_daemon_port() -> int | None:
-    """Read the daemon port from the port file, or None if not running."""
-    if not PORT_FILE.exists():
-        return None
-    try:
-        port = int(PORT_FILE.read_text().strip())
-        # Check if daemon is actually listening
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0)
-            s.connect(("127.0.0.1", port))
-        return port
-    except (ValueError, OSError):
-        # Port file stale or daemon not running
-        PORT_FILE.unlink(missing_ok=True)
-        PID_FILE.unlink(missing_ok=True)
-        return None
-
-
-def is_daemon_running() -> bool:
-    return get_daemon_port() is not None
 
 
 class DaemonServer:
@@ -133,6 +108,7 @@ class DaemonServer:
         req_id = msg.get("id", 0)
         method = msg.get("method", "")
         params = msg.get("params", {})
+        started = time.perf_counter()
 
         handlers = {
             "session/start": self._handle_session_start,
@@ -152,15 +128,40 @@ class DaemonServer:
 
         handler = handlers.get(method)
         if handler is None:
+            emit_event("daemon.dispatch.missing", method=method, request_id=req_id)
             return make_error(req_id, -32601, f"Method not found: {method}")
 
         try:
             result = handler(params)
+            emit_event(
+                "daemon.dispatch.ok",
+                method=method,
+                request_id=req_id,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                status=result.get("status") if isinstance(result, dict) else None,
+                session=params.get("session"),
+                file=params.get("file"),
+                root=params.get("root"),
+            )
             return Response(id=req_id, result=result)
         except KeyError as e:
+            emit_event(
+                "daemon.dispatch.key_error",
+                method=method,
+                request_id=req_id,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                error=str(e),
+            )
             return make_error(req_id, -32602, str(e))
         except Exception as e:
             log.error("Handler error for %s: %s", method, e, exc_info=True)
+            emit_event(
+                "daemon.dispatch.error",
+                method=method,
+                request_id=req_id,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                error=str(e),
+            )
             return make_error(req_id, -32000, str(e))
 
     # --- Session handlers ---
@@ -204,13 +205,14 @@ class DaemonServer:
         """
         session_name = params.get("session")
         file_path = params.get("file")
+        root_path = params.get("root")
 
         if session_name:
             return self.session_manager.get_session(session_name)
 
         if file_path:
             # Try existing session first
-            session = self.session_manager.find_session_for_file(file_path)
+            session = self.session_manager.find_session_for_path(file_path)
             if session:
                 return session
 
@@ -219,6 +221,20 @@ class DaemonServer:
             if detection:
                 root, lang_hint = detection
                 lang = _auto_detect_language(file_path, lang_hint)
+                if lang:
+                    name = self._generate_session_name(root)
+                    log.info("Auto-creating session %r for %s (%s)", name, root, lang)
+                    return self.session_manager.start_session(name, root, lang)
+
+        if root_path:
+            session = self.session_manager.find_session_for_path(root_path)
+            if session:
+                return session
+
+            detection = _auto_detect_root(root_path)
+            if detection:
+                root, lang_hint = detection
+                lang = _auto_detect_language(root_path, lang_hint)
                 if lang:
                     name = self._generate_session_name(root)
                     log.info("Auto-creating session %r for %s (%s)", name, root, lang)
@@ -294,11 +310,7 @@ class DaemonServer:
         symbols = server.request_full_symbol_tree()
         # Filter by query if provided
         if query:
-            query_lower = query.lower()
-            symbols = [
-                s for s in symbols
-                if query_lower in (s.get("name", "") if isinstance(s, dict) else getattr(s, "name", "")).lower()
-            ]
+            symbols = _filter_symbol_tree(symbols, query)
 
         return [_format_symbol(s) for s in symbols]
 
@@ -455,9 +467,7 @@ def _to_relative(file_path: str, root: str) -> str:
 
 def _format_location(loc: dict, root: str) -> dict:
     """Format an LSP Location dict for CLI output."""
-    rel_path = loc.get("relativePath", "")
-    # Normalize to forward slashes for cross-platform consistency
-    rel_path = rel_path.replace("\\", "/")
+    rel_path = _extract_location_path(loc, root)
     range_info = loc.get("range", {})
     start = range_info.get("start", {})
 
@@ -472,6 +482,55 @@ def _format_location(loc: dict, root: str) -> dict:
         result["preview"] = loc["preview"]
 
     return result
+
+
+def _extract_location_path(loc: dict[str, Any], root: str) -> str:
+    """Extract the best available path from a backend location payload."""
+    for key in ("relativePath", "relative_path", "file"):
+        value = loc.get(key)
+        if isinstance(value, str) and value:
+            return value.replace("\\", "/")
+
+    for key in ("absolutePath", "path"):
+        value = loc.get(key)
+        if isinstance(value, str) and value:
+            return _to_relative(value, root)
+
+    uri = loc.get("uri")
+    if isinstance(uri, str) and uri:
+        parsed = urlparse(uri)
+        if parsed.scheme == "file":
+            abs_path = url2pathname(parsed.path)
+            if os.name == "nt" and abs_path.startswith("/") and len(abs_path) > 2 and abs_path[2] == ":":
+                abs_path = abs_path[1:]
+            return _to_relative(abs_path, root)
+
+    return ""
+
+
+def _filter_symbol_tree(symbols: list[Any], query: str) -> list[Any]:
+    """Recursively filter a symbol tree while preserving matching descendants."""
+    query_lower = query.lower()
+    matches: list[Any] = []
+
+    for symbol in symbols:
+        if not isinstance(symbol, dict):
+            continue
+
+        children = symbol.get("children", [])
+        matched_children = _filter_symbol_tree(children, query) if isinstance(children, list) else []
+        name = symbol.get("name", "")
+        name_matches = isinstance(name, str) and query_lower in name.lower()
+
+        if name_matches or matched_children:
+            filtered = dict(symbol)
+            if matched_children:
+                filtered["children"] = matched_children
+            elif "children" in filtered:
+                filtered.pop("children")
+            matches.append(filtered)
+
+    return matches
 
 
 def _format_hover(hover: dict) -> dict:

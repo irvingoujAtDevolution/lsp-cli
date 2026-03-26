@@ -8,12 +8,15 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Annotated, Optional
+import time
+from typing import Annotated, Any, Optional
 
 import typer
 
 from lsp_cli.client import DaemonClient
+from lsp_cli.daemon_state import is_daemon_running
 from lsp_cli.locate import Location
+from lsp_cli.observability import read_events
 
 
 def _loc_params(loc: Location, session: str | None) -> dict:
@@ -61,6 +64,29 @@ def _error(msg: str) -> None:
 
 def _client() -> DaemonClient:
     return DaemonClient(auto_start=True)
+
+
+def _call_with_wait(method: str, params: dict[str, Any], wait: bool) -> Any:
+    """Optionally poll until a session leaves starting/indexing state."""
+    client = _client()
+    result = client.call(method, params)
+    if not wait:
+        return result
+
+    deadline = time.monotonic() + 30.0
+    while (
+        isinstance(result, dict)
+        and result.get("status") in {"starting", "indexing"}
+        and time.monotonic() < deadline
+    ):
+        retry_after = result.get("retry_after", 1)
+        sleep_seconds = max(0.2, min(float(retry_after), deadline - time.monotonic()))
+        if sleep_seconds <= 0:
+            break
+        time.sleep(sleep_seconds)
+        result = client.call(method, params)
+
+    return result
 
 
 # === Session commands ===
@@ -129,11 +155,12 @@ def session_info(
 def definition(
     locate: Annotated[str, typer.Argument(help="file:line:col location")],
     session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session name")] = None,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Poll until the session is ready")] = True,
 ) -> None:
     """Jump to definition of symbol at location."""
     try:
         loc = Location.parse(locate)
-        result = _client().call("lsp/definition", _loc_params(loc, session))
+        result = _call_with_wait("lsp/definition", _loc_params(loc, session), wait)
         _output(result)
     except Exception as e:
         _error(str(e))
@@ -143,11 +170,12 @@ def definition(
 def references(
     locate: Annotated[str, typer.Argument(help="file:line:col location")],
     session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session name")] = None,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Poll until the session is ready")] = True,
 ) -> None:
     """Find all references to symbol at location."""
     try:
         loc = Location.parse(locate)
-        result = _client().call("lsp/references", _loc_params(loc, session))
+        result = _call_with_wait("lsp/references", _loc_params(loc, session), wait)
         _output(result)
     except Exception as e:
         _error(str(e))
@@ -157,11 +185,12 @@ def references(
 def hover(
     locate: Annotated[str, typer.Argument(help="file:line:col location")],
     session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session name")] = None,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Poll until the session is ready")] = True,
 ) -> None:
     """Get type signature and docs at location."""
     try:
         loc = Location.parse(locate)
-        result = _client().call("lsp/hover", _loc_params(loc, session))
+        result = _call_with_wait("lsp/hover", _loc_params(loc, session), wait)
         _output(result)
     except Exception as e:
         _error(str(e))
@@ -171,13 +200,16 @@ def hover(
 def symbols(
     query: Annotated[str, typer.Argument(help="Symbol name query")],
     session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session name")] = None,
+    root: Annotated[Optional[str], typer.Option("--root", "-r", help="Project path to auto-detect a session from")] = None,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Poll until the session is ready")] = True,
 ) -> None:
     """Search symbols by name across the project."""
     try:
-        result = _client().call("lsp/symbols", {
+        result = _call_with_wait("lsp/symbols", {
             "query": query,
             "session": session,
-        })
+            "root": os.path.abspath(root) if root else (None if session else os.getcwd()),
+        }, wait)
         _output(result)
     except Exception as e:
         _error(str(e))
@@ -188,16 +220,17 @@ def diagnostics(
     file: Annotated[Optional[str], typer.Argument(help="File path (optional)")] = None,
     session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session name")] = None,
     fresh: Annotated[bool, typer.Option("--fresh", help="Wait for file watcher to process pending changes")] = False,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Poll until the session is ready")] = True,
 ) -> None:
     """Get diagnostics (errors/warnings) for a file."""
     try:
         if fresh:
             import time
             time.sleep(0.5)  # Brief wait for file watcher debounce
-        result = _client().call("lsp/diagnostics", {
+        result = _call_with_wait("lsp/diagnostics", {
             "file": os.path.abspath(file) if file else None,
             "session": session,
-        })
+        }, wait)
         _output(result)
     except Exception as e:
         _error(str(e))
@@ -207,13 +240,14 @@ def diagnostics(
 def outline(
     file: Annotated[str, typer.Argument(help="File path")],
     session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session name")] = None,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Poll until the session is ready")] = True,
 ) -> None:
     """Get file structure (classes, functions, methods)."""
     try:
-        result = _client().call("lsp/outline", {
+        result = _call_with_wait("lsp/outline", {
             "file": os.path.abspath(file),
             "session": session,
-        })
+        }, wait)
         _output(result)
     except Exception as e:
         _error(str(e))
@@ -311,29 +345,32 @@ Just query -- sessions are auto-created from your file path:
     lsp references D:\\project\\foo.rs:1:1 # Or absolute paths
 
 On first use for a project, the language server starts indexing in the background.
-You'll get an immediate response like:
+If you pass --no-wait you'll get an immediate response like:
 
     {"status": "indexing", "retry_after": 15, "elapsed_seconds": 0}
 
-Just retry after the suggested seconds. Never blocks, never times out.
+Read-only queries wait for a usable session by default. On very large repos a
+session may become "warm" before it is fully indexed; queries can still run
+while background indexing continues. Pass --no-wait if you want the immediate
+starting/indexing response instead.
 
 ## Query Commands
 
 All positions are 1-indexed (line 1 = first line, col 1 = first char).
 
-    lsp hover <file>:<line>:<col>        # Type signature and docs
-    lsp definition <file>:<line>:<col>   # Jump to definition
-    lsp references <file>:<line>:<col>   # Find all usages
-    lsp symbols "<query>"                # Search symbols by name
-    lsp diagnostics <file> [--fresh]     # Errors/warnings (--fresh waits for pending changes)
-    lsp outline <file>                   # File structure (kinds: Function, Struct, etc.)
+    lsp hover <file>:<line>:<col> [--no-wait]         # Type signature and docs
+    lsp definition <file>:<line>:<col> [--no-wait]    # Jump to definition
+    lsp references <file>:<line>:<col> [--no-wait]    # Find all usages
+    lsp symbols "<query>" [--root <path>] [--no-wait] # Search symbols by name
+    lsp diagnostics <file> [--fresh] [--no-wait]      # Errors/warnings (--fresh waits for pending changes)
+    lsp outline <file> [--no-wait]                    # File structure (kinds: Function, Struct, etc.)
     lsp rename <file>:<line>:<col> <new> # Preview rename (--dry-run default)
 
 ## Session Management (Optional)
 
 Sessions are auto-created, but you can manage them explicitly:
 
-    lsp session list                     # See all active sessions
+    lsp session list                     # See all active sessions and their status
     lsp session start <name> --root <path> --lang <language> [--solution <file.sln>]
     lsp session stop <name>
 
@@ -358,6 +395,8 @@ Combine multiple queries in one call to reduce round trips:
 - The daemon auto-starts on first CLI call -- no manual setup needed
 - Sessions auto-create from file paths — no need to specify language or project root
 - After writing files, use --fresh on diagnostics to wait for LS to process changes
+- Use `lsp daemon events --tail 50` to inspect recent structured timings and state transitions
+- `warm` means queryable before full indexing/quiescence; `ready` means fully ready
 - All output is JSON to stdout; errors go to stderr
 - Use --session <name> to target a specific session when multiple projects are open
 - lsp daemon status shows all active sessions and PID
@@ -379,10 +418,13 @@ def daemon_start(
     foreground: Annotated[bool, typer.Option("--foreground", "-f", help="Run in foreground")] = False,
 ) -> None:
     """Start the LSP daemon."""
-    from lsp_cli.daemon import is_daemon_running
-
     if is_daemon_running():
-        _error("Daemon is already running")
+        try:
+            result = DaemonClient(auto_start=False).call("daemon/status")
+            _output({"status": "already_running", **result})
+            return
+        except Exception as e:
+            _error(str(e))
 
     if foreground:
         from lsp_cli.daemon import run_daemon
@@ -402,9 +444,14 @@ def daemon_stop() -> None:
     """Stop the LSP daemon."""
     try:
         result = _client().call("daemon/shutdown")
+        for _ in range(50):
+            if not is_daemon_running():
+                _output({"status": "stopped"})
+                return
+            time.sleep(0.1)
         _output(result)
     except ConnectionError:
-        sys.stderr.write("Daemon is not running.\n")
+        _output({"status": "not_running"})
     except Exception as e:
         _error(str(e))
 
@@ -417,6 +464,18 @@ def daemon_status() -> None:
         _output(result)
     except ConnectionError:
         _output({"status": "not_running"})
+    except Exception as e:
+        _error(str(e))
+
+
+@daemon_app.command("events")
+def daemon_events(
+    tail: Annotated[int, typer.Option("--tail", help="Number of recent events to return")] = 50,
+    event: Annotated[Optional[str], typer.Option("--event", help="Filter to a specific event name")] = None,
+) -> None:
+    """Show recent structured observability events."""
+    try:
+        _output(read_events(limit=tail, event=event))
     except Exception as e:
         _error(str(e))
 

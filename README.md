@@ -37,12 +37,14 @@ lsp-cli uses [SolidLSP](https://github.com/oraios/serena) from the Serena projec
 # Just query -- everything is auto-detected
 lsp hover src/main.rs:42:10
 
-# First call for a project returns immediately with indexing status:
-# {"status": "indexing", "retry_after": 15, "elapsed_seconds": 0}
+# Read-only queries wait for a usable session by default
+lsp symbols "_resolve_session"
 
-# Retry after the suggested seconds to get actual results
-lsp hover src/main.rs:42:10
-# {"contents": "fn main()", "language": "markdown"}
+# Opt out if you want the immediate starting/indexing response
+lsp symbols "_resolve_session" --no-wait
+
+# Large monorepos may first become "warm" before they are fully indexed.
+# In that state, queries are allowed to run while background indexing continues.
 ```
 
 ## Commands
@@ -50,14 +52,14 @@ lsp hover src/main.rs:42:10
 All positions are **1-indexed** (line 1 = first line, col 1 = first character).
 
 ```bash
-lsp hover <file>:<line>:<col>        # Type signature and docs
-lsp definition <file>:<line>:<col>   # Jump to definition
-lsp references <file>:<line>:<col>   # Find all usages
-lsp symbols "<query>"                # Search symbols by name
-lsp diagnostics <file> [--fresh]     # Errors/warnings
-lsp outline <file>                   # File structure (Function, Struct, etc.)
-lsp rename <file>:<line>:<col> <new> # Preview rename (--dry-run default)
-lsp skill                            # Print usage guide (for agent context injection)
+lsp hover <file>:<line>:<col> [--no-wait]         # Type signature and docs
+lsp definition <file>:<line>:<col> [--no-wait]    # Jump to definition
+lsp references <file>:<line>:<col> [--no-wait]    # Find all usages
+lsp symbols "<query>" [--root <path>] [--no-wait] # Search symbols by name
+lsp diagnostics <file> [--fresh] [--no-wait]      # Errors/warnings
+lsp outline <file> [--no-wait]                    # File structure (Function, Struct, etc.)
+lsp rename <file>:<line>:<col> <new>          # Preview rename (--dry-run default)
+lsp skill                                      # Print usage guide (for agent context injection)
 ```
 
 ### Session Management (optional)
@@ -65,7 +67,7 @@ lsp skill                            # Print usage guide (for agent context inje
 Sessions are auto-created, but you can manage them explicitly:
 
 ```bash
-lsp session list
+lsp session list   # statuses include starting, warm, ready, error, stopped
 lsp session start <name> --root <path> --lang <language>
 lsp session stop <name>
 ```
@@ -86,7 +88,12 @@ EOF
 lsp daemon status    # Check if daemon is running
 lsp daemon start     # Start daemon (auto-starts on first query anyway)
 lsp daemon stop      # Stop daemon and all sessions
+lsp daemon events --tail 50  # Inspect recent structured timings/state
 ```
+
+`warm` means the session crossed the startup timeout and is already queryable,
+but the language server may still be indexing a large workspace in the
+background. `ready` means the server reported full readiness.
 
 ## Supported Languages
 

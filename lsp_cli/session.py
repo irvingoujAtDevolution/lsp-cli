@@ -15,15 +15,95 @@ from solidlsp.ls import SolidLanguageServer
 from solidlsp.ls_config import Language, LanguageServerConfig
 
 from lsp_cli.file_watcher import FileWatcher, create_session_watcher
+from lsp_cli.observability import emit_event
 
 log = logging.getLogger(__name__)
+
+DEFAULT_STARTUP_BARRIER_TIMEOUT_SECS = 10.0
+STARTUP_BARRIER_TIMEOUT_BY_LANGUAGE = {
+    Language.RUST: 10.0,
+}
+STARTUP_BARRIER_ATTRS = (
+    "server_ready",
+    "analysis_complete",
+    "service_ready_event",
+)
 
 
 class SessionStatus(str, Enum):
     STARTING = "starting"
+    WARM = "warm"
     READY = "ready"
     ERROR = "error"
     STOPPED = "stopped"
+
+
+def _startup_barrier_timeout(server: SolidLanguageServer) -> float:
+    return STARTUP_BARRIER_TIMEOUT_BY_LANGUAGE.get(server.language, DEFAULT_STARTUP_BARRIER_TIMEOUT_SECS)
+
+
+def _soften_startup_barriers(server: SolidLanguageServer) -> None:
+    """Bound language-specific startup waits so large workspaces become queryable sooner."""
+    timeout_secs = _startup_barrier_timeout(server)
+    startup_state = getattr(server, "_lsp_cli_startup_state", None)
+    if startup_state is None:
+        startup_state = {
+            "warm": False,
+            "fully_ready": False,
+            "barrier": None,
+            "promotion_started": False,
+        }
+        setattr(server, "_lsp_cli_startup_state", startup_state)
+
+    for attr_name in STARTUP_BARRIER_ATTRS:
+        readiness_event = getattr(server, attr_name, None)
+        if readiness_event is None or getattr(readiness_event, "_lsp_cli_patched", False):
+            continue
+        if not isinstance(readiness_event, threading.Event):
+            continue
+
+        original_wait = readiness_event.wait
+
+        def wait_with_timeout(timeout: float | None = None, *, _attr_name: str = attr_name) -> bool:
+            effective_timeout = timeout_secs if timeout is None else min(timeout, timeout_secs)
+            is_ready = original_wait(effective_timeout)
+            if not is_ready:
+                startup_state["warm"] = True
+                startup_state["barrier"] = _attr_name
+                log.warning(
+                    "%s did not signal %s within %.1fs; proceeding with a warm session",
+                    server.language.value,
+                    _attr_name,
+                    effective_timeout,
+                )
+                emit_event(
+                    "session.warm",
+                    language=server.language.value,
+                    timeout_secs=effective_timeout,
+                    root_path=getattr(server, "repository_root_path", None),
+                    barrier=_attr_name,
+                )
+                if not startup_state["promotion_started"]:
+                    startup_state["promotion_started"] = True
+
+                    def wait_for_full_ready() -> None:
+                        original_wait()
+                        startup_state["fully_ready"] = True
+                        callback = getattr(server, "_lsp_cli_on_fully_ready", None)
+                        if callback is not None:
+                            callback(_attr_name)
+
+                    threading.Thread(
+                        target=wait_for_full_ready,
+                        daemon=True,
+                        name=f"session-promote-{server.language.value}",
+                    ).start()
+            else:
+                startup_state["fully_ready"] = True
+            return is_ready
+
+        setattr(readiness_event, "_lsp_cli_patched", True)
+        readiness_event.wait = wait_with_timeout  # type: ignore[method-assign]
 
 
 @dataclass
@@ -78,6 +158,8 @@ class Session:
     def _start_blocking(self) -> None:
         """Blocking initialization — runs in background thread."""
         ctx = None
+        started = time.perf_counter()
+        emit_event("session.starting", name=self.name, root_path=self.root_path, language=self.language.value)
         try:
             # For C#: check for ambiguous solutions before starting
             if self.language == Language.CSHARP and not self.solution:
@@ -87,6 +169,8 @@ class Session:
             server = SolidLanguageServer.create(
                 config, self.root_path
             )
+            setattr(server, "_lsp_cli_on_fully_ready", self._on_server_fully_ready)
+            _soften_startup_barriers(server)
             # Patch solution discovery if a specific solution was requested
             if self.solution:
                 self._patch_solution_hint(server)
@@ -107,7 +191,8 @@ class Session:
 
                 self._server = srv
                 self._server_ctx = ctx
-                self.status = SessionStatus.READY
+                startup_state = getattr(server, "_lsp_cli_startup_state", {})
+                self.status = SessionStatus.WARM if startup_state.get("warm") and not startup_state.get("fully_ready") else SessionStatus.READY
 
             # Start file watcher (outside lock)
             watcher = create_session_watcher(self)
@@ -115,6 +200,24 @@ class Session:
             with self._lock:
                 self._watcher = watcher
             log.info("Session %s started for %s (%s)", self.name, self.root_path, self.language.value)
+            if self.status == SessionStatus.WARM:
+                emit_event(
+                    "session.state",
+                    name=self.name,
+                    root_path=self.root_path,
+                    language=self.language.value,
+                    status=self.status.value,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                    barrier=startup_state.get("barrier"),
+                )
+            else:
+                emit_event(
+                    "session.ready",
+                    name=self.name,
+                    root_path=self.root_path,
+                    language=self.language.value,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                )
         except Exception as e:
             # Clean up context manager if it was entered
             if ctx is not None:
@@ -129,6 +232,28 @@ class Session:
                 self.status = SessionStatus.ERROR
                 self.error_message = str(e)
             log.error("Failed to start session %s: %s", self.name, e)
+            emit_event(
+                "session.error",
+                name=self.name,
+                root_path=self.root_path,
+                language=self.language.value,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                error=str(e),
+            )
+
+    def _on_server_fully_ready(self, barrier: str) -> None:
+        with self._lock:
+            if self.status != SessionStatus.WARM or self._server is None or self._stop_requested:
+                return
+            self.status = SessionStatus.READY
+
+        emit_event(
+            "session.ready",
+            name=self.name,
+            root_path=self.root_path,
+            language=self.language.value,
+            barrier=barrier,
+        )
 
     def _patch_solution_hint(self, server: SolidLanguageServer) -> None:
         """Monkey-patch SolidLSP's solution discovery to return our preferred .sln file.
@@ -208,6 +333,7 @@ class Session:
                 self._server = None
             self.status = SessionStatus.STOPPED
             log.info("Session %s stopped", self.name)
+            emit_event("session.stopped", name=self.name, root_path=self.root_path, language=self.language.value)
 
     @property
     def server(self) -> SolidLanguageServer:
@@ -261,7 +387,7 @@ class SessionManager:
         with self._lock:
             if name in self._sessions:
                 session = self._sessions[name]
-                if session.status in (SessionStatus.READY, SessionStatus.STARTING):
+                if session.status in (SessionStatus.READY, SessionStatus.WARM, SessionStatus.STARTING):
                     return session
                 # Error or stopped — restart
                 session.stop()
@@ -299,8 +425,8 @@ class SessionManager:
         with self._lock:
             return [s.to_dict() for s in self._sessions.values()]
 
-    def find_session_for_file(self, file_path: str) -> Session | None:
-        """Auto-route: find the session whose root is the longest prefix of file_path.
+    def find_session_for_path(self, path: str) -> Session | None:
+        """Auto-route: find the session whose root is the longest prefix of a path.
 
         Matches both READY and STARTING sessions (so queries return
         indexing status instead of 'no session found').
@@ -308,12 +434,12 @@ class SessionManager:
         Uses case-insensitive comparison on Windows and requires a path
         separator after the root to prevent D:\\foo matching D:\\foobar.
         """
-        abs_path = os.path.normcase(os.path.abspath(file_path))
+        abs_path = os.path.normcase(os.path.abspath(path))
         best: Session | None = None
         best_len = 0
         with self._lock:
             for session in self._sessions.values():
-                if session.status not in (SessionStatus.READY, SessionStatus.STARTING):
+                if session.status not in (SessionStatus.READY, SessionStatus.WARM, SessionStatus.STARTING):
                     continue
                 root = os.path.normcase(session.root_path)
                 # Require separator guard: root must be a proper prefix
@@ -321,6 +447,10 @@ class SessionManager:
                     best = session
                     best_len = len(root)
         return best
+
+    def find_session_for_file(self, file_path: str) -> Session | None:
+        """Backward-compatible wrapper for file-path routing."""
+        return self.find_session_for_path(file_path)
 
     def stop_all(self) -> None:
         """Stop all sessions."""
