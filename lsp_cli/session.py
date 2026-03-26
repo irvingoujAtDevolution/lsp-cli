@@ -33,6 +33,7 @@ class Session:
     name: str
     root_path: str
     language: Language
+    solution: str | None = None
     status: SessionStatus = SessionStatus.STOPPED
     started_at: float | None = None
     _server: SolidLanguageServer | None = field(default=None, repr=False)
@@ -82,6 +83,9 @@ class Session:
             server = SolidLanguageServer.create(
                 config, self.root_path
             )
+            # Patch solution discovery if a specific solution was requested
+            if self.solution:
+                self._patch_solution_hint(server)
             ctx = server.start_server()
             srv = ctx.__enter__()
 
@@ -121,6 +125,44 @@ class Session:
                 self.status = SessionStatus.ERROR
                 self.error_message = str(e)
             log.error("Failed to start session %s: %s", self.name, e)
+
+    def _patch_solution_hint(self, server: SolidLanguageServer) -> None:
+        """Monkey-patch SolidLSP's solution discovery to return our preferred .sln file.
+
+        SolidLSP's C# language server uses find_solution_or_project_file() in
+        create_launch_command() and also does an inline breadth-first scan in
+        _open_solution_and_projects(). We patch both so the specified solution
+        is consistently used.
+        """
+        solution_path = os.path.abspath(self.solution)
+        if not os.path.isfile(solution_path):
+            log.warning("Solution file not found: %s", solution_path)
+            return
+
+        try:
+            from solidlsp.language_servers import csharp_language_server as cs_mod
+
+            # Patch module-level find_solution_or_project_file (used in create_launch_command)
+            def patched_find(root_dir: str) -> str | None:
+                log.info("Using specified solution: %s", solution_path)
+                return solution_path
+            cs_mod.find_solution_or_project_file = patched_find
+
+            # Patch breadth_first_file_scan so _open_solution_and_projects finds
+            # our solution first (it scans for .sln/.slnx and .csproj inline)
+            original_scan = cs_mod.breadth_first_file_scan
+
+            def patched_scan(root_dir: str):
+                # Yield our solution first, then the rest
+                yield solution_path
+                for f in original_scan(root_dir):
+                    if f != solution_path:
+                        yield f
+            cs_mod.breadth_first_file_scan = patched_scan
+
+            log.info("Patched C# solution discovery → %s", solution_path)
+        except (ImportError, AttributeError) as e:
+            log.warning("Could not patch solution discovery: %s", e)
 
     def stop(self) -> None:
         """Stop the language server and file watcher.
@@ -162,6 +204,8 @@ class Session:
             "status": self.status.value,
             "error": self.error_message,
         }
+        if self.solution:
+            d["solution"] = self.solution
         if self.status == SessionStatus.STARTING and self.started_at is not None:
             elapsed = int(time.time() - self.started_at)
             d["elapsed_seconds"] = elapsed
@@ -181,11 +225,17 @@ class SessionManager:
         name: str,
         root_path: str,
         language: str,
+        solution: str | None = None,
     ) -> Session:
         """Start a new session (non-blocking) or return existing one.
 
         Returns immediately. The session will be in STARTING status
         until the language server finishes initialization.
+
+        Args:
+            solution: Path to a specific .sln file (for C# monorepos with
+                      multiple solutions). If not provided, SolidLSP picks
+                      the first .sln it finds.
         """
         with self._lock:
             if name in self._sessions:
@@ -197,7 +247,7 @@ class SessionManager:
 
             lang = Language(language)
             root = os.path.abspath(root_path)
-            session = Session(name=name, root_path=root, language=lang)
+            session = Session(name=name, root_path=root, language=lang, solution=solution)
             self._sessions[name] = session
             # C1 fix: call start_async inside manager lock so the session
             # is never visible to other threads as STOPPED. start_async

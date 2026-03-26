@@ -169,7 +169,8 @@ class DaemonServer:
         name = params["name"]
         root = params["root"]
         lang = params["language"]
-        session = self.session_manager.start_session(name, root, lang)
+        solution = params.get("solution")
+        session = self.session_manager.start_session(name, root, lang, solution=solution)
         return session.to_dict()  # Returns immediately (non-blocking)
 
     def _check_session_ready(self, session: Any) -> dict | None:

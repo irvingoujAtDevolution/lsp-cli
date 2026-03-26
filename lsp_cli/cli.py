@@ -71,14 +71,18 @@ def session_start(
     name: Annotated[str, typer.Argument(help="Session name")],
     root: Annotated[str, typer.Option("--root", "-r", help="Project root path")],
     lang: Annotated[str, typer.Option("--lang", "-l", help="Language (rust, csharp, typescript, python, ...)")],
+    solution: Annotated[Optional[str], typer.Option("--solution", help="Path to .sln file (for C# monorepos with multiple solutions)")] = None,
 ) -> None:
     """Start a new language server session."""
     try:
-        result = _client().call("session/start", {
+        params: dict = {
             "name": name,
             "root": root,
             "language": lang,
-        })
+        }
+        if solution:
+            params["solution"] = os.path.abspath(solution)
+        result = _client().call("session/start", params)
         _output(result)
     except Exception as e:
         _error(str(e))
@@ -330,8 +334,12 @@ All positions are 1-indexed (line 1 = first line, col 1 = first char).
 Sessions are auto-created, but you can manage them explicitly:
 
     lsp session list                     # See all active sessions
-    lsp session start <name> --root <path> --lang <language>
+    lsp session start <name> --root <path> --lang <language> [--solution <file.sln>]
     lsp session stop <name>
+
+For C# monorepos with multiple .sln files, use --solution to pick which one:
+
+    lsp session start rdm-win --root D:\\RDM --lang csharp --solution D:\\RDM\\RemoteDesktopManagerWindows.sln
 
 Supported languages: rust, csharp, python, typescript, java, go, cpp, and more.
 
