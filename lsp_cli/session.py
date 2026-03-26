@@ -79,6 +79,10 @@ class Session:
         """Blocking initialization — runs in background thread."""
         ctx = None
         try:
+            # For C#: check for ambiguous solutions before starting
+            if self.language == Language.CSHARP and not self.solution:
+                self._check_ambiguous_solutions()
+
             config = LanguageServerConfig(code_language=self.language)
             server = SolidLanguageServer.create(
                 config, self.root_path
@@ -163,6 +167,23 @@ class Session:
             log.info("Patched C# solution discovery → %s", solution_path)
         except (ImportError, AttributeError) as e:
             log.warning("Could not patch solution discovery: %s", e)
+
+    def _check_ambiguous_solutions(self) -> None:
+        """Fail early if multiple .sln files exist and none was specified.
+
+        Without this, SolidLSP silently picks the first .sln from a
+        breadth-first scan, which is non-deterministic in monorepos.
+        """
+        root = Path(self.root_path)
+        sln_files = sorted(root.glob("*.sln"))
+        if len(sln_files) > 1:
+            names = ", ".join(f.name for f in sln_files)
+            raise RuntimeError(
+                f"Multiple .sln files found in {self.root_path}: {names}. "
+                f"Use --solution to specify which one, e.g.: "
+                f"lsp session start {self.name} --root {self.root_path} "
+                f"--lang csharp --solution {sln_files[0]}"
+            )
 
     def stop(self) -> None:
         """Stop the language server and file watcher.
