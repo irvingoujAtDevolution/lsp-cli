@@ -1,0 +1,21 @@
+[project]
+name = "lsp-cli"
+version = "0.1.0"
+description = "CLI tool wrapping LSP servers behind a daemon for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "serena-agent @ git+https://github.com/oraios/serena.git",
+    "typer>=0.12.0",
+    "watchfiles>=1.0.0",
+]
+
+[project.scripts]
+lsp = "lsp_cli.cli:app"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
