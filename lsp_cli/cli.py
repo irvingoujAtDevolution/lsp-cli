@@ -66,6 +66,61 @@ def _client() -> DaemonClient:
     return DaemonClient(auto_start=True)
 
 
+def _format_wait_hint(session_info: dict[str, Any]) -> str | None:
+    status = session_info.get("status")
+    progress = session_info.get("progress")
+    if not isinstance(progress, dict):
+        return None
+
+    details: list[str] = []
+    phase = progress.get("phase")
+    if isinstance(phase, str) and phase and phase not in {"unknown", status}:
+        details.append(phase)
+
+    message = progress.get("message") or progress.get("title")
+    if isinstance(message, str) and message:
+        details.append(message)
+
+    percentage = progress.get("percentage")
+    if isinstance(percentage, (int, float)):
+        details.append(f"{percentage:g}%")
+
+    current_file = progress.get("current_file")
+    if isinstance(current_file, str) and current_file:
+        details.append(current_file)
+
+    observed_files = progress.get("observed_files")
+    if isinstance(observed_files, int) and observed_files > 0:
+        details.append(f"observed={observed_files}")
+
+    completed = progress.get("completed")
+    total = progress.get("total")
+    if isinstance(completed, int) and isinstance(total, int) and total > 0:
+        details.append(f"{completed}/{total}")
+
+    if not details:
+        return status if isinstance(status, str) else None
+    prefix = status if isinstance(status, str) and status else "progress"
+    return f"{prefix}: {' | '.join(details)}"
+
+
+def _emit_wait_hint(client: DaemonClient, result: dict[str, Any], last_hint: str | None) -> str | None:
+    session_name = result.get("name")
+    session_info = result
+    if isinstance(session_name, str) and session_name:
+        try:
+            session_info = client.call("session/info", {"name": session_name})
+        except Exception:
+            session_info = result
+
+    hint = _format_wait_hint(session_info)
+    if hint and hint != last_hint:
+        sys.stderr.write(f"{hint}\n")
+        sys.stderr.flush()
+        return hint
+    return last_hint
+
+
 def _call_with_wait(method: str, params: dict[str, Any], wait: bool) -> Any:
     """Optionally poll until a session leaves starting/indexing state."""
     client = _client()
@@ -74,11 +129,13 @@ def _call_with_wait(method: str, params: dict[str, Any], wait: bool) -> Any:
         return result
 
     deadline = time.monotonic() + 30.0
+    last_hint: str | None = None
     while (
         isinstance(result, dict)
         and result.get("status") in {"starting", "indexing"}
         and time.monotonic() < deadline
     ):
+        last_hint = _emit_wait_hint(client, result, last_hint)
         retry_after = result.get("retry_after", 1)
         sleep_seconds = max(0.2, min(float(retry_after), deadline - time.monotonic()))
         if sleep_seconds <= 0:
@@ -371,6 +428,7 @@ All positions are 1-indexed (line 1 = first line, col 1 = first char).
 Sessions are auto-created, but you can manage them explicitly:
 
     lsp session list                     # See all active sessions and their status
+    lsp session info <name>             # Includes best-effort progress + raw payload
     lsp session start <name> --root <path> --lang <language> [--solution <file.sln>]
     lsp session stop <name>
 
@@ -397,6 +455,7 @@ Combine multiple queries in one call to reduce round trips:
 - After writing files, use --fresh on diagnostics to wait for LS to process changes
 - Use `lsp daemon events --tail 50` to inspect recent structured timings and state transitions
 - `warm` means queryable before full indexing/quiescence; `ready` means fully ready
+- `session info` exposes best-effort progress derived from LSP/server notifications
 - All output is JSON to stdout; errors go to stderr
 - Use --session <name> to target a specific session when multiple projects are open
 - lsp daemon status shows all active sessions and PID

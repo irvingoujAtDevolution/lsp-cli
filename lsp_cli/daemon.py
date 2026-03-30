@@ -191,7 +191,7 @@ class DaemonServer:
 
     def _handle_session_info(self, params: dict) -> dict:
         session = self.session_manager.get_session(params["name"])
-        return session.to_dict()
+        return session.to_dict(include_progress_raw=True)
 
     # --- LSP query handlers ---
 

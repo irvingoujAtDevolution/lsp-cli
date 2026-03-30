@@ -11,7 +11,13 @@ from solidlsp.ls_config import Language
 from lsp_cli.daemon import _extract_location_path, _filter_symbol_tree
 from lsp_cli.daemon_state import release_startup_lock, try_acquire_startup_lock
 from lsp_cli.observability import read_events
-from lsp_cli.session import Session, SessionManager, SessionStatus, _soften_startup_barriers
+from lsp_cli.session import (
+    Session,
+    SessionManager,
+    SessionStatus,
+    _normalize_progress_notification,
+    _soften_startup_barriers,
+)
 
 
 class DaemonHelpersTest(unittest.TestCase):
@@ -132,6 +138,77 @@ class DaemonHelpersTest(unittest.TestCase):
 
         self.assertEqual(server.server_ready, "not-an-event")
 
+
+    def test_normalize_progress_notification_handles_progress_report(self) -> None:
+        progress = _normalize_progress_notification(
+            "$/progress",
+            {
+                "token": "1",
+                "value": {
+                    "kind": "report",
+                    "title": "Indexing workspace",
+                    "message": "Loading crate graph",
+                    "percentage": 42,
+                },
+            },
+            r"D:\repo",
+        )
+
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress["phase"], "loading_workspace")
+        self.assertEqual(progress["percentage"], 42)
+        self.assertEqual(progress["source"], "lsp-progress")
+
+    def test_normalize_progress_notification_extracts_counts(self) -> None:
+        progress = _normalize_progress_notification(
+            "$/progress",
+            {
+                "token": "rustAnalyzer/Roots Scanned",
+                "value": {
+                    "kind": "report",
+                    "message": "223/716",
+                    "percentage": 31,
+                },
+            },
+            r"D:\repo",
+        )
+
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress["phase"], "indexing")
+        self.assertEqual(progress["completed"], 223)
+        self.assertEqual(progress["total"], 716)
+
+    def test_normalize_progress_notification_extracts_diagnostics_file(self) -> None:
+        progress = _normalize_progress_notification(
+            "textDocument/publishDiagnostics",
+            {"uri": "file:///D:/repo/src/main.rs", "diagnostics": []},
+            r"D:\repo",
+        )
+
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress["current_file"], "src/main.rs")
+        self.assertEqual(progress["phase"], "analyzing")
+
+    def test_session_to_dict_includes_progress(self) -> None:
+        session = Session(
+            name="gateway",
+            root_path=r"D:\repo",
+            language=Language.RUST,
+            status=SessionStatus.WARM,
+        )
+        session._progress.phase = "indexing"
+        session._progress.message = "Loading workspace"
+        session._progress.source = "lsp-progress"
+        session._progress.last_update_time = 1.0
+
+        data = session.to_dict(include_progress_raw=True)
+
+        self.assertIn("progress", data)
+        self.assertEqual(data["progress"]["phase"], "indexing")
+        self.assertEqual(data["progress"]["message"], "Loading workspace")
 
     def test_find_session_for_path_accepts_warm_sessions(self) -> None:
         manager = SessionManager()

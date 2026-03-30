@@ -68,6 +68,7 @@ Sessions are auto-created, but you can manage them explicitly:
 
 ```bash
 lsp session list   # statuses include starting, warm, ready, error, stopped
+lsp session info <name>  # includes best-effort progress snapshot + raw payload
 lsp session start <name> --root <path> --lang <language>
 lsp session stop <name>
 ```
@@ -94,6 +95,12 @@ lsp daemon events --tail 50  # Inspect recent structured timings/state
 `warm` means the session crossed the startup timeout and is already queryable,
 but the language server may still be indexing a large workspace in the
 background. `ready` means the server reported full readiness.
+
+Progress is best-effort. When the language server emits notifications such as
+`$/progress`, `experimental/serverStatus`, or diagnostics updates, `lsp-cli`
+surfaces them in `session list`, `session info`, and `lsp daemon events`.
+Depending on the backend, this may include phase, message, percentage,
+completed/total counts, current file hints, and observed file counts.
 
 ## Supported Languages
 
