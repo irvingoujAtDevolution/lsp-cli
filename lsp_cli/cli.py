@@ -421,14 +421,14 @@ All positions are 1-indexed (line 1 = first line, col 1 = first char).
     lsp symbols "<query>" [--root <path>] [--no-wait] # Search symbols by name
     lsp diagnostics <file> [--fresh] [--no-wait]      # Errors/warnings (--fresh waits for pending changes)
     lsp outline <file> [--no-wait]                    # File structure (kinds: Function, Struct, etc.)
-    lsp rename <file>:<line>:<col> <new> # Preview rename (--dry-run default)
+    lsp rename <file>:<line>:<col> <new>              # Currently not implemented in daemon mode
 
 ## Session Management (Optional)
 
 Sessions are auto-created, but you can manage them explicitly:
 
     lsp session list                     # See all active sessions and their status
-    lsp session info <name>             # Includes best-effort progress + raw payload
+    lsp session info <name>              # Includes best-effort progress + raw payload
     lsp session start <name> --root <path> --lang <language> [--solution <file.sln>]
     lsp session stop <name>
 
@@ -454,9 +454,11 @@ Combine multiple queries in one call to reduce round trips:
 - Sessions auto-create from file paths — no need to specify language or project root
 - After writing files, use --fresh on diagnostics to wait for LS to process changes
 - Use `lsp daemon events --tail 50` to inspect recent structured timings and state transitions
+- Use `lsp daemon events --tail 20 --event session.progress` to inspect best-effort progress history
 - `warm` means queryable before full indexing/quiescence; `ready` means fully ready
+- `session list` shows a compact progress snapshot when available
 - `session info` exposes best-effort progress derived from LSP/server notifications
-- All output is JSON to stdout; errors go to stderr
+- Final results go to stdout as JSON; wait hints and errors go to stderr
 - Use --session <name> to target a specific session when multiple projects are open
 - lsp daemon status shows all active sessions and PID
 """

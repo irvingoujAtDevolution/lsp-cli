@@ -769,6 +769,8 @@ class SessionManager:
             lang = Language(language)
             root = os.path.abspath(root_path)
             session = Session(name=name, root_path=root, language=lang, solution=solution)
+            if session.language == Language.CSHARP and not session.solution:
+                session._check_ambiguous_solutions()
             self._sessions[name] = session
             # C1 fix: call start_async inside manager lock so the session
             # is never visible to other threads as STOPPED. start_async
@@ -797,7 +799,25 @@ class SessionManager:
     def list_sessions(self, include_progress_raw: bool = False) -> list[dict]:
         """List all sessions as dicts."""
         with self._lock:
-            return [s.to_dict(include_progress_raw=include_progress_raw) for s in self._sessions.values()]
+            sessions = list(self._sessions.values())
+
+        serialized: list[dict] = []
+        for session in sessions:
+            try:
+                serialized.append(session.to_dict(include_progress_raw=include_progress_raw))
+            except Exception as e:
+                log.warning("Failed to serialize session %s: %s", getattr(session, "name", "<unknown>"), e)
+                language = getattr(session, "language", None)
+                serialized.append(
+                    {
+                        "name": getattr(session, "name", "<unknown>"),
+                        "root_path": getattr(session, "root_path", ""),
+                        "language": language.value if isinstance(language, Language) else str(language),
+                        "status": "error",
+                        "error": f"Failed to serialize session: {e}",
+                    }
+                )
+        return serialized
 
     def find_session_for_path(self, path: str) -> Session | None:
         """Auto-route: find the session whose root is the longest prefix of a path.

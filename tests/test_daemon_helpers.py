@@ -210,6 +210,39 @@ class DaemonHelpersTest(unittest.TestCase):
         self.assertEqual(data["progress"]["phase"], "indexing")
         self.assertEqual(data["progress"]["message"], "Loading workspace")
 
+    def test_start_session_rejects_ambiguous_csharp_solutions_before_async_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "A.sln").write_text("", encoding="utf-8")
+            Path(tmp, "B.sln").write_text("", encoding="utf-8")
+            manager = SessionManager()
+
+            with self.assertRaises(RuntimeError):
+                manager.start_session("rdm", tmp, "csharp")
+
+            self.assertEqual(manager.list_sessions(), [])
+
+    def test_list_sessions_tolerates_serialization_failure(self) -> None:
+        manager = SessionManager()
+        session = Session(
+            name="broken",
+            root_path=r"D:\repo",
+            language=Language.RUST,
+            status=SessionStatus.WARM,
+        )
+
+        def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("serialize failed")
+
+        session.to_dict = boom  # type: ignore[method-assign]
+        manager._sessions[session.name] = session
+
+        result = manager.list_sessions()
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "broken")
+        self.assertEqual(result[0]["status"], "error")
+        self.assertIn("serialize failed", result[0]["error"])
+
     def test_find_session_for_path_accepts_warm_sessions(self) -> None:
         manager = SessionManager()
         session = Session(
